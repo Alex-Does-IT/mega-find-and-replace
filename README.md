@@ -113,6 +113,12 @@ Use a local tree you control and pause other writers during apply and undo. Each
 
 Run `python3 -m unittest -v` from this folder. The suite uses disposable directories and exercises nested renames, encodings, permissions, exclusions, collision handling, undo, and interruption recovery.
 
+### Test the VS Code extension locally
+
+1. Open this repository in VS Code and press **F5**. The **Run Mega Find and Replace from source** configuration opens an **Extension Development Host** window with a temporary profile. It loads the extension directly from your checkout.
+2. In the development window, open a disposable folder where you can try real renames. For a quick test, create `Bob/Bob.txt` containing `getBob BOB_DOES_THIS`. Open **Mega Replace**, preview `Bob` → `Martin`, inspect the diff, then use **Replace All** and **Undo last sweep**. Check that undo restores both the path and the text.
+3. Edit the source in the original window. To pick up saved changes, run **Developer: Reload Window** in the development window. Stop the debug session with **Shift+F5** in the original window.
+
 ## License
 
 Copyright (c) 2026 Alex Does IT LLC. Distributed under the [MIT License](LICENSE).
