@@ -5,7 +5,7 @@
   "author": { "name": "Alex Does IT LLC" },
   "description": "Rename files, folders, and text references together. Preserve casing, preview diffs, and undo in VS Code or the CLI.",
   "publisher": "alexdoesitllc",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/Alex-Does-IT/mega-find-and-replace.git" },
   "homepage": "https://github.com/Alex-Does-IT/mega-find-and-replace#readme",

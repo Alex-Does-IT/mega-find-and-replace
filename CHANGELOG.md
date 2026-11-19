@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.7
+
+Added a screenshot walkthrough of a `Bob` → `Martin` rename, including the Command Palette shortcuts, folder scope, and diff preview.
+
 ## 0.1.6
 
 Shortened the README and updated the Marketplace listing with a worked example of renaming files, folders, and text across naming conventions.
