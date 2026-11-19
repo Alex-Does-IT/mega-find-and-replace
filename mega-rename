@@ -675,6 +675,10 @@ def copy_for_edit(path, stage):
     security.SetFileSecurityW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
     security.GetSecurityDescriptorControl.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.WORD),
                                                        ctypes.POINTER(wintypes.DWORD)]
+    to_string = security.ConvertSecurityDescriptorToStringSecurityDescriptorW
+    to_string.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                          ctypes.POINTER(wintypes.LPWSTR), ctypes.c_void_p]
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
 
     def descriptor(file, field):
         size = wintypes.DWORD()
@@ -686,9 +690,21 @@ def copy_for_edit(path, stage):
             raise ctypes.WinError(ctypes.get_last_error())
         return data.raw
 
+    def field_value(data, field):
+        # Self-relative descriptor headers can carry unrelated control flags.
+        # SDDL compares the requested SID or ACL, including its inheritance.
+        value = wintypes.LPWSTR()
+        if not to_string(data, 1, field, ctypes.byref(value), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return value.value
+        finally:
+            kernel.LocalFree(value)
+
     for field in (1, 2, 4):  # OWNER, GROUP, DACL_SECURITY_INFORMATION
         desired = descriptor(path, field)
-        if descriptor(stage, field) == desired:
+        desired_value = field_value(desired, field)
+        if field_value(descriptor(stage, field), field) == desired_value:
             continue
         flags = field
         if field == 4:
@@ -698,8 +714,9 @@ def copy_for_edit(path, stage):
             flags |= 0x80000000 if control.value & 0x1000 else 0x20000000
         if not security.SetFileSecurityW(str(stage), flags, desired):
             raise ctypes.WinError(ctypes.get_last_error())
-        if descriptor(stage, field) != desired:
-            raise Problem(f"Cannot preserve the Windows security descriptor for {str(path)!r}")
+        if field_value(descriptor(stage, field), field) != desired_value:
+            field_name = {1: "owner", 2: "group", 4: "DACL"}[field]
+            raise Problem(f"Cannot preserve the Windows {field_name} for {str(path)!r}")
 
 
 def output_mode(path):
