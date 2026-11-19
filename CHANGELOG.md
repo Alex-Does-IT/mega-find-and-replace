@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.5
+
+Published the VS Code edition under the registered Alex Does IT LLC publisher, `alexdoesitllc`. The CLI and rename behavior are the same as in 0.1.4.
+
 ## 0.1.4
 
 First release packaged for Alex Does IT LLC under the MIT License.

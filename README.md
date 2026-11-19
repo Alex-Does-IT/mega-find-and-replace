@@ -6,7 +6,13 @@ Created by **Alex Does IT LLC**. Use the VS Code extension or the `mega-rename` 
 
 The extension and CLI require macOS or Linux with Python 3.9 or newer. On Linux the engine uses GNU `cp` and `renameat2`.
 
-For VS Code, download the `.vsix` from the [GitHub releases](https://github.com/Alex-Does-IT/mega-find-and-replace/releases). In the Command Palette, run **Extensions: Install from VSIX…** and select the downloaded file. If you installed the development extension under `alex-local.mega-find-and-replace`, uninstall that copy when switching to the company release.
+Install **Mega Find and Replace** from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=alexdoesitllc.mega-find-and-replace), or use the VS Code CLI:
+
+```sh
+code --install-extension alexdoesitllc.mega-find-and-replace
+```
+
+For a manual installation, download the `.vsix` from [GitHub Releases](https://github.com/Alex-Does-IT/mega-find-and-replace/releases) and run **Extensions: Install from VSIX…** in the Command Palette. If you previously installed the `alex-local` development build or the `alex-does-it` 0.1.4 release, uninstall that copy when switching to the Marketplace edition. VS Code treats each publisher ID as a separate extension.
 
 For the standalone CLI, clone this repository and run `./mega-rename --help`.
 
