@@ -1,0 +1,48 @@
+{
+  "name": "mega-find-and-replace",
+  "displayName": "Mega Find and Replace",
+  "icon": "vscode/media/icon.png",
+  "author": { "name": "Alex Does IT LLC" },
+  "description": "Case-aware search and replace across file contents, filenames, and folders, with regex, diff previews, and undo.",
+  "publisher": "alexdoesit-llc",
+  "version": "0.1.4",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/alexdoesit-llc/mega-find-and-replace.git" },
+  "homepage": "https://github.com/alexdoesit-llc/mega-find-and-replace#readme",
+  "bugs": { "url": "https://github.com/alexdoesit-llc/mega-find-and-replace/issues" },
+  "keywords": ["rename", "find and replace", "refactor", "regex", "filenames"],
+  "private": true,
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["Other"],
+  "main": "./vscode/extension.js",
+  "extensionKind": ["workspace"],
+  "capabilities": {
+    "untrustedWorkspaces": { "supported": false },
+    "virtualWorkspaces": { "supported": false }
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "megaReplace", "title": "Mega Replace", "icon": "vscode/media/activity.svg" }
+      ]
+    },
+    "views": {
+      "megaReplace": [
+        { "type": "webview", "id": "megaReplace.search", "name": "Search" }
+      ]
+    },
+    "commands": [
+      { "command": "megaReplace.open", "title": "Find and Replace", "category": "Mega Replace" },
+      { "command": "megaReplace.inFolder", "title": "Mega Replace in Folder…" }
+    ],
+    "menus": {
+      "explorer/context": [
+        { "command": "megaReplace.inFolder", "when": "explorerResourceIsFolder && resourceScheme == file", "group": "navigation@8" }
+      ],
+      "commandPalette": [
+        { "command": "megaReplace.inFolder", "when": "false" }
+      ]
+    }
+  },
+  "files": ["mega-rename", "vscode/extension.js", "vscode/media/**", "README.md", "LICENSE", "CHANGELOG.md"]
+}

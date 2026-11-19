@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src {{source}}; script-src 'nonce-{{nonce}}';">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="{{style}}">
+  <title>Mega Replace</title>
+</head>
+<body>
+  <main>
+    <div class="scope"><span>Folder</span><button id="scope" title="Choose a folder">Choose folder…</button></div>
+    <div class="query">
+      <input type="text" id="find" aria-label="Search" placeholder="Search" spellcheck="false" autocomplete="off">
+      <button id="exact" class="toggle" aria-label="Match case" aria-pressed="false" title="Match case and use replacement spelling as typed">Aa</button>
+      <button id="regex" class="toggle" aria-label="Use regular expression" aria-pressed="false" title="Use regular expression">.*</button>
+    </div>
+    <input type="text" id="replace" aria-label="Replace" placeholder="Replace" spellcheck="false" autocomplete="off">
+    <label id="deleteRow" hidden><input id="deleting" type="checkbox"> Replace matches with empty text</label>
+    <details id="options"><summary>Search options</summary>
+      <label for="exclude">Files and folders to exclude</label>
+      <input type="text" id="exclude" placeholder="e.g. *.lock, dist" spellcheck="false">
+      <label><input type="checkbox" id="substring"> Match inside words</label>
+      <label><input type="checkbox" id="ignored"> Include ignored files</label>
+    </details>
+    <div class="actions">
+      <button id="apply" class="primary" disabled>Replace All</button>
+      <button id="undo" class="secondary">Undo last sweep</button>
+      <button id="refresh" class="tool" aria-label="Refresh results" title="Refresh results">↻</button>
+    </div>
+    <div id="notice" role="status"></div>
+    <div id="status" role="status" aria-live="polite"></div>
+    <div id="results" aria-label="Search results"></div>
+    <button id="more" class="secondary" hidden>Show more results</button>
+  </main>
+  <script src="{{script}}" nonce="{{nonce}}"></script>
+</body>
+</html>

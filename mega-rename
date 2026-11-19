@@ -1,0 +1,765 @@
+#!/usr/bin/env python3
+"""Preview, apply and undo a case-aware project rename. Created by Alex Does IT LLC. Requires Python 3.9+."""
+from __future__ import annotations
+
+import argparse
+import codecs
+import ctypes
+import difflib
+import fcntl
+import fnmatch
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+from collections import Counter
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from functools import lru_cache
+from itertools import zip_longest
+from pathlib import Path
+
+STATE = ".mega-rename"
+PROTECTED = {STATE, ".git", ".hg", ".svn"}
+DEFAULT_SKIP = {"node_modules", ".venv", "venv", "__pycache__", ".tox", ".next",
+                ".pytest_cache", ".mypy_cache", ".ruff_cache", ".gradle", ".DS_Store"}
+BINARY_SUFFIXES = set("""
+    .7z .a .avif .bmp .bz2 .class .db .dll .doc .docx .dylib .eot .epub .exe
+    .flac .gif .gz .heic .ico .jar .jpeg .jpg .mov .mp3 .mp4 .o .otf .pdf
+    .png .ppt .pptx .pyc .so .sqlite .sqlite3 .tar .tiff .ttf .wasm .webm
+    .webp .woff .woff2 .xls .xlsx .xz .zip
+""".split())
+MAGIC = b"mega-rename transaction storage v1\n"
+
+
+class Problem(Exception):
+    pass
+
+
+def name_key(name):
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def words(name):
+    if not re.fullmatch(r"[A-Za-z0-9]+(?:[ ._-]+[A-Za-z0-9]+)*", name):
+        raise Problem("Use words separated by case, spaces, dots, underscores or hyphens, "
+                      "or use --literal for exact text.")
+    parts = re.split(r"[ ._-]+", name)
+    return [w for part in parts for w in
+            re.findall(r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[A-Z]+|[0-9]+", part)]
+
+
+def spellings(parts):
+    lower = [p.lower() for p in parts]
+    all_caps = "".join(parts).isupper()
+    caps = [p if p.isupper() and not all_caps else p.capitalize() for p in parts]
+    result = {"pascal": "".join(caps), "camel": lower[0] + "".join(caps[1:])}
+    for sep in ("_", "-", ".", " ", ""):
+        result["lower" + sep] = sep.join(lower)
+        result["upper" + sep] = sep.join(lower).upper()
+        result["title" + sep] = sep.join(caps)
+        if sep:
+            result["sentence" + sep] = sep.join(caps[:1] + lower[1:])
+    return result
+
+
+def boundary(s, i):
+    if i == 0 or i == len(s):
+        return True
+    a, b = s[i-1:i+1]
+    return (not a.isalnum() or not b.isalnum() or a.isdigit() != b.isdigit()
+            or (a.islower() and b.isupper())
+            or (a.isupper() and b.isupper() and s[i+1:i+2].islower()))
+
+
+def choose_style(s, i, j, choices):
+    # Neighboring delimiters and camel humps disambiguate single-word matches.
+    for sep in ("_", "-"):
+        if s[i-1:i] == sep or s[j:j+1] == sep:
+            for prefix in ("upper", "lower", "title"):
+                if prefix + sep in choices:
+                    return prefix + sep
+    if s[j:j+1].isupper() and "camel" in choices:
+        return "camel"
+    for style in ("upper_", "lower_", "pascal", "camel"):
+        if style in choices:
+            return style
+    return next(iter(choices))
+
+
+class Rewrite:
+    def __init__(self, old, new, literal, substring):
+        for value in (old, new):
+            if not value or re.search(r"[/\\\x00-\x1f\x7f]", value):
+                raise Problem("Each term must be nonempty and usable in a single filename.")
+        self.literal, self.substring, self.old, self.new = literal, substring, old, new
+        if literal:
+            self.pattern = re.compile(re.escape(old))
+            return
+        src, dest = spellings(words(old)), spellings(words(new))
+        self.variants = {}
+        for style, spelling in src.items():
+            self.variants.setdefault(spelling, {})[style] = dest[style]
+        self.variants.setdefault(old, {"exact": new})
+        self.pattern = re.compile("|".join(re.escape(s) for s in
+                                           sorted(self.variants, key=len, reverse=True)))
+
+    def matches(self, s):
+        start = 0
+        while m := self.pattern.search(s, start):
+            i, j = m.span()
+            if not (self.literal or self.substring) and not (boundary(s, i) and boundary(s, j)):
+                start = i + 1  # A valid multiword match can overlap this rejected one.
+                continue
+            yield m
+            start = j
+
+    def __call__(self, s):
+        if self.literal:
+            return s.replace(self.old, self.new)
+        pieces = []
+        copied = 0
+        for m in self.matches(s):
+            i, j = m.span()
+            choices = self.variants[m[0]]
+            pieces.extend((s[copied:i], choices[choose_style(s, i, j, choices)]))
+            copied = j
+        if not pieces:
+            return s
+        pieces.append(s[copied:])
+        return "".join(pieces)
+
+
+class RegexRewrite:
+    # Replacement tokens are literal strings or validated integer group indices.
+    tokens = re.compile(r"\$\$|\$([0-9]+)|\$\{([^}]*)\}|\$\{")
+    identifier = re.compile(r"[^\W\d_][^\W_]*(?:[_. -][^\W_]+)*")
+    template_word = re.compile(r"[^\W\d_][^\W_]*")
+
+    def __init__(self, pattern, template, exact):
+        if not pattern:
+            raise Problem("Supply a nonempty regex pattern.")
+        try:
+            self.pattern = re.compile(pattern, 0 if exact else re.IGNORECASE)
+        except (re.error, OverflowError, RecursionError) as error:
+            raise Problem(f"Invalid regex: {error}") from error
+        parts = []
+        end = 0
+        for token in self.tokens.finditer(template):
+            parts.append(template[end:token.start()])
+            end = token.end()
+            if token[0] == "$$":
+                parts.append("$")
+                continue
+            ref = token[1] or token[2]
+            if ref is None or ref == "":
+                raise Problem(f"Invalid capture reference at replacement offset {token.start()}.")
+            if re.fullmatch(r"[0-9]+", ref):
+                group = int(ref)
+            else:
+                group = self.pattern.groupindex.get(ref, -1)
+            if not 0 <= group <= self.pattern.groups:
+                raise Problem(f"Unknown capture group {token[0]!r}.")
+            parts.append(group)
+        parts.append(template[end:])
+        self.parts = parts
+        self.groups = {part for part in parts if isinstance(part, int) and part != 0}
+        self.adapt_case = not exact and any(isinstance(p, str) and self.template_word.search(p)
+                                            for p in parts)
+
+    def case_sample(self, match):
+        # Sample the text being replaced. Copied captures can have unrelated case
+        # (BOB_mIxEd), overlap one another, or lie outside the match in a lookaround.
+        pos, end = match.span()
+        for left, right in sorted(match.span(group) for group in self.groups):
+            if left == right or right <= pos or left >= end:
+                continue
+            sample = self.identifier.search(match.string, pos, left)
+            if sample:
+                return sample
+            pos = min(end, right)
+        return (self.identifier.search(match.string, pos, end)
+                or self.identifier.search(match.string, match.start(), end))
+
+    @staticmethod
+    def style(sample):
+        word = sample[0]
+        separator = re.search(r"[_. -]", word)
+        if separator:
+            if word.isupper():
+                case = "upper"
+            elif word.islower():
+                case = "lower"
+            elif word[0].isupper() and word[separator.end():].islower():
+                case = "sentence"
+            else:
+                case = "title"
+            return case + separator[0]
+        if word.isupper():
+            choices = ("upper_", "upper-")
+        elif word.islower():
+            choices = ("lower_", "lower-", "camel")
+        elif word.istitle():
+            choices = ("pascal", "title_", "title-")
+        else:
+            return "pascal" if word[0].isupper() else "camel"
+        return choose_style(sample.string, sample.start(), sample.end(), choices)
+
+    @staticmethod
+    @lru_cache(maxsize=256)
+    def styled_text(text, style):
+        def styled_word(match):
+            word = match[0]
+            cuts = [0] + [i for i in range(1, len(word)) if boundary(word, i)] + [len(word)]
+            return spellings([word[i:j] for i, j in zip(cuts, cuts[1:])])[style]
+        return RegexRewrite.template_word.sub(styled_word, text)
+
+    def replacement(self, match):
+        sample = self.case_sample(match) if self.adapt_case else None
+        style = self.style(sample) if sample else None
+        pieces = []
+        for part in self.parts:
+            if isinstance(part, int):
+                pieces.append(match[part] or "")
+            elif style:
+                pieces.append(self.styled_text(part, style))
+            else:
+                pieces.append(part)
+        return "".join(pieces)
+
+    def __call__(self, s):
+        return self.pattern.sub(self.replacement, s)
+
+    def matches(self, s):
+        return self.pattern.finditer(s)
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def rewrite_bytes(data, rewrite):
+    encoding = "utf-8"
+    prefix = b""
+    for bom, enc in ((codecs.BOM_UTF32_LE, "utf-32-le"), (codecs.BOM_UTF32_BE, "utf-32-be"),
+                     (codecs.BOM_UTF16_LE, "utf-16-le"), (codecs.BOM_UTF16_BE, "utf-16-be"),
+                     (codecs.BOM_UTF8, "utf-8")):
+        if data.startswith(bom):
+            encoding, prefix = enc, bom
+            break
+    try:
+        old = data[len(prefix):].decode(encoding)
+    except UnicodeDecodeError:
+        return None
+    if re.search(r"[\x00-\x08\x0b\x0e-\x1f\x7f]", old):
+        return None
+    new = rewrite(old)
+    return old, new, prefix + new.encode(encoding) if new != old else data
+
+
+def ignored_by_git(root):
+    git = shutil.which("git")
+    if not git:
+        return set()
+    cmd = [git, "-C", root]
+    probe = subprocess.run(cmd + ["rev-parse", "--is-inside-work-tree"], capture_output=True)
+    if probe.returncode or probe.stdout.strip() != b"true":
+        return set()
+    raw = subprocess.check_output(cmd + ["ls-files", "--others", "--ignored", "--exclude-standard",
+                                         "--directory", "-z", "--", "."])
+    items = raw.split(b"\0")
+    ignored = {os.fsdecode(item) for item in items if item and not item.endswith(b"/")}
+    # ls-files may also list an unignored folder when every file in it is ignored.
+    dirs = [b"./" + item[:-1] for item in items if item.endswith(b"/")]
+    if dirs:
+        checked = subprocess.run(cmd + ["check-ignore", "--stdin", "-z"],
+                                 input=b"\0".join(dirs) + b"\0", stdout=subprocess.PIPE)
+        if checked.returncode not in (0, 1):
+            raise Problem("Git could not verify ignored directories.")
+        ignored.update(os.fsdecode(item[2:]) for item in checked.stdout.split(b"\0") if item)
+    return ignored
+
+
+def identity(st):
+    return (st.st_dev, st.st_ino)
+
+
+@lru_cache(maxsize=1)
+def linux_mounts():
+    """Include same-device bind mounts, which Path.is_mount() can miss."""
+    if not sys.platform.startswith("linux"):
+        return set()
+    entries = Path("/proc/self/mountinfo").read_bytes().splitlines()
+    def unescape(match):
+        return bytes([int(match[1], 8)])
+    return {Path(os.fsdecode(re.sub(rb"\\([0-7]{3})", unescape, line.split()[4])))
+            for line in entries}
+
+
+@dataclass
+class Plan:
+    edits: list = field(default_factory=list)
+    renames: list = field(default_factory=list)
+    skipped: Counter = field(default_factory=Counter)
+    results: list = field(default_factory=list)
+
+    def fingerprint(self, root):
+        # Exclude display-only snippets. Bind the reviewed paths, identities and bytes.
+        data = (identity(root.stat()), self.edits, self.renames)
+        return digest(json.dumps(data, default=str).encode())
+
+
+def excerpt(line, column):
+    start = max(0, column - 55)
+    return ("…" if start else "") + line[start:start + 180].rstrip("\r\n") + (
+        "…" if len(line) > start + 180 else "")
+
+
+def first_change(old, new):
+    for line, (a, b) in enumerate(zip_longest(io.StringIO(old), io.StringIO(new), fillvalue=""), 1):
+        if a != b:
+            column = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+            return {"line": line, "before": excerpt(a, column), "after": excerpt(b, column)}
+
+
+def first_hit(text, rewrite):
+    match = next(rewrite.matches(text), None)
+    if match is None:
+        return None
+    start = text.rfind("\n", 0, match.start()) + 1
+    end = text.find("\n", match.start())
+    return {"line": text.count("\n", 0, start) + 1,
+            "before": excerpt(text[start:end if end >= 0 else len(text)], match.start() - start)}
+
+
+def check_destination(source, target):
+    if not os.path.lexists(target):
+        return
+    # A case-insensitive volume can resolve two spellings to the same entry.
+    # Distinct hard links are separate entries even when their inode is identical.
+    if (name_key(source.name) == name_key(target.name)
+            and os.path.samestat(source.lstat(), target.lstat())
+            and target.name not in os.listdir(target.parent)):
+        return
+    raise Problem(f"Destination already exists: {str(target)!r}")
+
+
+def scan(root, rewrite, args):
+    plan = Plan()
+    ignored = set() if args.include_ignored else ignored_by_git(root)
+    root_dev = root.stat().st_dev
+
+    def visit(folder, final_parent):
+        entries = sorted(folder.iterdir(), key=lambda p: p.name)
+        destinations = {}
+        for path in entries:
+            name = path.name
+            rel = path.relative_to(root)
+            st = path.lstat()
+            new = name
+            skip = None
+            if name_key(name) in PROTECTED:
+                skip = "metadata"
+            elif stat.S_ISLNK(st.st_mode):
+                skip = "symlink"
+            elif (st.st_dev != root_dev or path in linux_mounts()
+                  or (stat.S_ISDIR(st.st_mode) and path.is_mount())):
+                skip = "mount"
+            elif not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
+                skip = "special"
+            elif any(fnmatch.fnmatchcase(name, g) or fnmatch.fnmatchcase(rel.as_posix(), g)
+                     for g in args.exclude):
+                skip = "excluded"
+            elif not args.include_ignored and (name in DEFAULT_SKIP or rel.as_posix() in ignored):
+                skip = "ignored"
+            elif stat.S_ISDIR(st.st_mode) and os.path.lexists(path / ".git"):
+                skip = "nested repository"
+
+            if skip:
+                plan.skipped[skip] += 1
+            else:
+                find_only = args.action == "preview" and args.find_only
+                new = name if find_only else rewrite(name)
+                if new != name and (new in ("", ".", "..") or name_key(new) in PROTECTED
+                                    or (args.regex and re.search(r"[/\\\x00-\x1f\x7f]", new))
+                                    or len(os.fsencode(new)) > os.pathconf(folder, "PC_NAME_MAX")):
+                    raise Problem(f"Invalid destination {new!r} for {str(rel)!r}")
+                final = final_parent / new
+                row = {"path": str(rel), "final": str(final), "directory": stat.S_ISDIR(st.st_mode)}
+                if find_only and next(rewrite.matches(name), None) is not None:
+                    row["nameMatch"] = True
+                if stat.S_ISDIR(st.st_mode):
+                    visit(path, final)
+                elif path.suffix.lower() in BINARY_SUFFIXES:
+                    plan.skipped["binary/unsupported contents"] += 1
+                elif st.st_size > args.max_mib * 1024 * 1024:
+                    plan.skipped["large file contents"] += 1
+                else:
+                    data = path.read_bytes()
+                    result = rewrite_bytes(data, (lambda s: s) if find_only else rewrite)
+                    if result is None:
+                        plan.skipped["binary/unsupported contents"] += 1
+                    elif find_only:
+                        row["sample"] = first_hit(result[0], rewrite)
+                    elif result[2] != data:
+                        plan.edits.append((rel, final, identity(st), digest(data), digest(result[2])))
+                        if args.action == "preview" and args.json:
+                            row["hash"] = plan.edits[-1][3]
+                            row["sample"] = first_change(result[0], result[1])
+                        if args.diff:
+                            for line in difflib.unified_diff(result[0].splitlines(True),
+                                                             result[1].splitlines(True),
+                                                             repr(str(rel)), repr(str(final))):
+                                print(line.rstrip("\r\n"))
+                if new != name:
+                    plan.renames.append((rel, new, final, identity(st)))
+                if args.action == "preview" and args.json and (
+                        new != name or row.get("nameMatch") or row.get("sample") or "hash" in row):
+                    plan.results.append(row)
+            destinations.setdefault(name_key(new), []).append((name, new))
+        for group in destinations.values():
+            if len(group) > 1 and any(a != b for a, b in group):
+                raise Problem(f"Name collision in {str(folder)!r}: {group!r}")
+        # Even an entry scheduled to move away must not be someone else's target.
+        for name, new in (pair for group in destinations.values() for pair in group):
+            if name != new:
+                check_destination(folder / name, folder / new)
+
+    visit(root, Path())
+    return plan
+
+
+def exclusive_move(source, target):
+    # rename(2) normally overwrites an existing destination, even after a preflight.
+    libc = ctypes.CDLL(None, use_errno=True)
+    a, b = os.fsencode(source), os.fsencode(target)
+    if sys.platform == "darwin":
+        result = libc.renamex_np(a, b, 4)  # RENAME_EXCL
+    elif sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+        result = libc.renameat2(-100, a, -100, b, 1)  # AT_FDCWD, RENAME_NOREPLACE
+    else:
+        raise Problem("Apply requires macOS or Linux with exclusive rename support.")
+    if result:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), f"{source} -> {target}")
+
+
+@contextmanager
+def locked(root):
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Problem(f"Another sweep is using {str(root)!r}.")
+        yield
+    finally:
+        os.close(fd)
+
+
+def storage(root, create=False):
+    area = root / STATE
+    marker = area / "format"
+    if not os.path.lexists(area):
+        if not create:
+            return None
+        # Publish a complete journal directory before accepting any transactions.
+        # An interruption during initialization leaves the reserved name available.
+        with tempfile.TemporaryDirectory(dir=root, prefix=".mega-rename-init-") as temp:
+            fresh = Path(temp) / STATE
+            fresh.mkdir(mode=0o700)
+            (fresh / ".gitignore").write_text("*\n")
+            (fresh / "format").write_bytes(MAGIC)
+            exclusive_move(fresh, area)
+    if (area.is_symlink() or not area.is_dir() or area.is_mount() or area in linux_mounts() or marker.is_symlink()
+            or not marker.is_file() or marker.read_bytes() != MAGIC):
+        raise Problem(f"Reserved path already in use: {str(area)!r}")
+    return area
+
+
+def latest(area):
+    if area:
+        for folder in sorted(area.glob("run-*"), reverse=True):
+            if folder.is_symlink() or not folder.is_dir() or folder.is_mount() or folder in linux_mounts():
+                raise Problem(f"Invalid transaction folder {str(folder)!r}")
+            return folder
+    return None
+
+
+def journal_file(session, filename):
+    path = session / filename
+    if path.is_symlink() or not path.is_file():
+        raise Problem(f"Missing or invalid journal file {str(path)!r}")
+    return path
+
+
+def status(session, phase=None, count=0):
+    if phase is None:
+        phase, n = journal_file(session, "status").read_text().split()
+        return phase, int(n)
+    # An interrupted replace leaves the previous complete cursor readable.
+    with tempfile.NamedTemporaryFile(mode="w", dir=session, delete=False) as f:
+        f.write(f"{phase} {count}\n")
+    os.replace(f.name, session / "status")
+
+
+def location(root, session, token):
+    kind, sep, value = token.partition("/")
+    parts = value.split("/")
+    if not sep or any(p in ("", ".", "..") for p in parts):
+        raise Problem(f"Invalid journal path {token!r}")
+    if kind == "save" and re.fullmatch(r"(before|after|move)-[0-9]+", value):
+        return session / value
+    if kind != "tree" or any(name_key(p) in PROTECTED for p in parts):
+        raise Problem(f"Invalid journal path {token!r}")
+    parent = root
+    for component in parts[:-1]:
+        parent = parent / component
+        if parent.is_symlink() or not parent.is_dir() or parent in linux_mounts() or parent.is_mount():
+            raise Problem(f"Directory changed: {str(parent)!r}")
+    return parent / parts[-1]
+
+
+def matches(path, ident):
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return False
+    return identity(st) == tuple(ident) and (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode))
+
+
+def check_hash(path, expected):
+    if expected and (not stat.S_ISREG(path.lstat().st_mode) or digest(path.read_bytes()) != expected):
+        raise Problem(f"Contents changed since the plan: {str(path)!r}")
+
+
+def transfer(root, session, move, reverse=False):
+    a, b, ident, checksum = move
+    source, target = (location(root, session, t) for t in ((b, a) if reverse else (a, b)))
+    if reverse and matches(target, ident) and not matches(source, ident):
+        return  # Cursor was recorded before apply, or undo completed before interruption.
+    if not matches(source, ident):
+        raise Problem(f"Expected file or directory moved or replaced: {str(source)!r}")
+    check_hash(source, checksum)
+    exclusive_move(source, target)
+
+
+def prepare(root, area, plan, rewrite):
+    work = Path(tempfile.mkdtemp(prefix="stage-", dir=area))
+    moves, outputs, renamed, edited = [], [], [], {}
+    try:
+        for i, (rel, final, ident, old_hash, new_hash) in enumerate(plan.edits):
+            path = location(root, work, f"tree/{rel}")
+            if not matches(path, ident):
+                raise Problem(f"File replaced since preview: {str(path)!r}")
+            stage = work / f"after-{i}"
+            # cp preserves POSIX modes and macOS extended metadata on this private copy.
+            cmd = ["cp", "-p"] if sys.platform == "darwin" else ["cp", "--preserve=all"]
+            subprocess.run(cmd + [path, stage], check=True)
+            original_stat, staged_stat = path.lstat(), stage.lstat()
+            if (original_stat.st_uid, original_stat.st_gid) != (staged_stat.st_uid, staged_stat.st_gid):
+                raise Problem(f"Cannot preserve file ownership for {str(path)!r}")
+            data = stage.read_bytes()
+            if digest(data) != old_hash:
+                raise Problem(f"File changed since preview: {str(path)!r}")
+            result = rewrite_bytes(data, rewrite)
+            if result is None or digest(result[2]) != new_hash:
+                raise Problem(f"Replacement changed since preview: {str(path)!r}")
+            mode = stat.S_IMODE(stage.stat().st_mode)
+            if not mode & stat.S_IWUSR:
+                stage.chmod(mode | stat.S_IWUSR)
+            stage.write_bytes(result[2])
+            stage.chmod(mode & ~(stat.S_ISUID | stat.S_ISGID))
+            new_ident = identity(stage.stat())
+            moves.extend([(f"tree/{rel}", f"save/before-{i}", ident, old_hash),
+                          (f"save/after-{i}", f"tree/{rel}", new_ident, new_hash)])
+            outputs.append((f"tree/{final}", new_ident, new_hash, stat.S_IMODE(stage.stat().st_mode)))
+            edited[rel] = new_ident
+        # Children move before their parents. Case-only renames need a temporary
+        # name so each operation has two distinct endpoints on all supported volumes.
+        for i, (rel, new, final, ident) in enumerate(plan.renames):
+            ident = edited.get(rel, ident)
+            source = f"tree/{rel}"
+            if name_key(rel.name) == name_key(new):
+                hold = f"save/move-{i}"
+                moves.append((source, hold, ident, None))
+                source = hold
+            moves.append((source, f"tree/{rel.with_name(new)}", ident, None))
+            renamed.append((f"tree/{final}", rel.name, ident))
+        (work / "manifest").write_text(json.dumps({"root": identity(root.stat()),
+                                                   "moves": moves, "outputs": outputs,
+                                                   "renamed": renamed}))
+        status(work, "applying", 0)
+        session = area / f"run-{time.time_ns():020d}-{work.name[6:]}"
+        exclusive_move(work, session)
+    except BaseException:
+        shutil.rmtree(work)
+        raise
+    return session, moves
+
+
+def restore(root, session):
+    manifest = json.loads(journal_file(session, "manifest").read_text())
+    moves = manifest["moves"]
+    if tuple(manifest["root"]) != identity(root.stat()):
+        raise Problem("The journal belongs to a different target directory.")
+    phase, count = status(session)
+    if phase not in {"applied", "applying", "undoing"} or not 0 <= count <= len(moves):
+        raise Problem("Invalid transaction cursor.")
+    if phase == "applied":
+        # Check every edited output before the first inverse rename.
+        for _, target, ident, checksum in moves:
+            if target.startswith("save/before-"):
+                backup = location(root, session, target)
+                if not matches(backup, ident):
+                    raise Problem(f"Original file missing from journal: {str(backup)!r}")
+                check_hash(backup, checksum)
+        for token, original_name, ident in manifest["renamed"]:
+            path = location(root, session, token)
+            if not matches(path, ident):
+                raise Problem(f"Renamed entry has moved or been replaced: {str(path)!r}")
+            check_destination(path, path.with_name(original_name))
+        for token, ident, checksum, mode in manifest["outputs"]:
+            path = location(root, session, token)
+            if not matches(path, ident):
+                raise Problem(f"Edited file has moved or been replaced: {str(path)!r}")
+            check_hash(path, checksum)
+            if stat.S_IMODE(path.stat().st_mode) != mode:
+                raise Problem(f"File permissions changed since the sweep: {str(path)!r}")
+    status(session, "undoing", count)
+    while count:
+        transfer(root, session, moves[count-1], reverse=True)
+        count -= 1
+        status(session, "undoing", count)
+    # Once removed from the run stack this transaction has been completely undone.
+    retired = session.with_name("done-" + session.name)
+    exclusive_move(session, retired)
+    shutil.rmtree(retired)
+
+
+def apply(root, plan, rewrite):
+    area = storage(root, create=True)
+    session, moves = prepare(root, area, plan, rewrite)
+    try:
+        for i, move in enumerate(moves, start=1):
+            status(session, "applying", i)
+            transfer(root, session, move)
+        status(session, "applied", len(moves))
+    except BaseException:
+        try:
+            restore(root, session)
+        except (OSError, ValueError, Problem) as e:
+            raise Problem(f"Rollback stopped: {e}. Journal retained. Resolve the conflict and run undo.")
+        print("Restored the pre-run tree.", file=sys.stderr)
+        raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="action", required=True)
+    for action, help_text in (("preview", "show proposed edits and final paths"),
+                              ("apply", "apply a sweep and keep an undo journal"),
+                              ("undo", "restore or recover the latest sweep")):
+        sub = commands.add_parser(action, help=help_text)
+        sub.add_argument("directory", type=Path)
+        if action == "undo":
+            continue
+        sub.add_argument("--json", action="store_true", help="emit a machine-readable result")
+        if action == "preview":
+            sub.add_argument("--find-only", action="store_true", help="list matching paths and text with --json")
+            sub.add_argument("--render-file", metavar="RELATIVE_PATH", help=argparse.SUPPRESS)
+            sub.add_argument("--source-hash", help=argparse.SUPPRESS)
+        else:
+            sub.add_argument("--expect-plan", help="require a matching preview fingerprint before applying")
+        sub.add_argument("old")
+        sub.add_argument("new")
+        mode = sub.add_mutually_exclusive_group()
+        mode.add_argument("--substring", action="store_true", help="also match inside ordinary words")
+        mode.add_argument("--literal", action="store_true", help="exact case-sensitive substring replacement")
+        mode.add_argument("--regex", dest="regex", action="store_const", const="styled",
+                          help="case-aware Python regex; use $1 to copy a capture")
+        mode.add_argument("--regex-exact", dest="regex", action="store_const", const="exact",
+                          help="case-sensitive Python regex with replacement literals as written")
+        sub.add_argument("--diff", action="store_true", help="also show content diffs")
+        sub.add_argument("--exclude", action="append", default=[], metavar="GLOB",
+                         help="skip a matching basename or relative path (repeatable)")
+        sub.add_argument("--include-ignored", action="store_true",
+                         help="also scan Git-ignored and common dependency/cache paths")
+        sub.add_argument("--max-mib", type=int, default=16, help="content size limit per file (default 16 MiB)")
+    args = parser.parse_args()
+    root = args.directory.expanduser().resolve(strict=True)
+    if not root.is_dir() or any(name_key(p) in PROTECTED for p in root.parts):
+        raise Problem("Select a project directory outside version-control and sweep metadata.")
+    with locked(root):
+        session = latest(storage(root))
+        if args.action == "undo":
+            if not session:
+                raise Problem("No sweep to undo in this directory.")
+            restore(root, session)
+            print(f"Restored the previous state of {str(root)!r}.")
+            return
+        if session and status(session)[0] != "applied":
+            raise Problem("An interrupted sweep needs recovery. Run undo on this directory first.")
+        if args.max_mib < 0:
+            raise Problem("--max-mib must be nonnegative.")
+        finding = args.action == "preview" and args.find_only
+        if finding and not args.json:
+            raise Problem("--find-only requires --json.")
+        if args.json and args.diff:
+            raise Problem("Choose --json or --diff.")
+        if args.regex:
+            rewrite = RegexRewrite(args.old, "" if finding else args.new, exact=args.regex == "exact")
+        else:
+            rewrite = Rewrite(args.old, args.old if finding else args.new, args.literal, args.substring)
+        if args.action == "preview" and args.render_file:
+            path = location(root, None, "tree/" + args.render_file)
+            st = path.lstat()
+            if (not stat.S_ISREG(st.st_mode) or st.st_size > args.max_mib * 1024 * 1024
+                    or st.st_dev != root.stat().st_dev or path in linux_mounts()):
+                raise Problem("This previewed file has changed. Refresh the results.")
+            data = path.read_bytes()
+            if digest(data) != args.source_hash:
+                raise Problem("File contents have changed. Refresh the results.")
+            result = rewrite_bytes(data, rewrite)
+            if result is None:
+                raise Problem("This file cannot be previewed as text.")
+            print(json.dumps({"text": result[1]}, ensure_ascii=False))
+            return
+        plan = scan(root, rewrite, args)
+        if args.action == "apply" and args.expect_plan and args.expect_plan != plan.fingerprint(root):
+            raise Problem("The project has changed since preview. Refresh the results before replacing.")
+        if args.json:
+            if args.action == "apply" and (plan.edits or plan.renames):
+                apply(root, plan, rewrite)
+            print(json.dumps({"edits": len(plan.edits), "renames": len(plan.renames),
+                              "fingerprint": plan.fingerprint(root), "results": plan.results,
+                              "skipped": plan.skipped}))
+            return
+        for rel, _, _, _, _ in plan.edits:
+            print(f"edit    {str(rel)!r}")
+        for rel, _, final, _ in plan.renames:
+            print(f"rename  {str(rel)!r} -> {str(final)!r}")
+        summary = f"{len(plan.edits)} file content edit(s), {len(plan.renames)} path rename(s)"
+        print(f"{args.action.capitalize()} in {str(root)!r}: {summary}.")
+        if plan.skipped:
+            print("Skipped: " + ", ".join(f"{n} {kind}" for kind, n in sorted(plan.skipped.items())))
+        if args.action == "apply" and (plan.edits or plan.renames):
+            apply(root, plan, rewrite)
+            print("Applied. Use undo with the same directory to restore this sweep.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (Problem, OSError, ValueError, subprocess.CalledProcessError) as error:
+        sys.exit(f"mega-rename: {error}")
+    except KeyboardInterrupt:
+        sys.exit("Interrupted.")

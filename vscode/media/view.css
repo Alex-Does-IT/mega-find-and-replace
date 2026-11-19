@@ -1,0 +1,42 @@
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; padding: 10px 12px 18px; color: var(--vscode-foreground); font: var(--vscode-font-size) var(--vscode-font-family); }
+button, input { font: inherit; color: inherit; }
+button, summary, label:has(input[type=checkbox]) { cursor: pointer; }
+button { border: 1px solid transparent; border-radius: 2px; background: transparent; }
+button:disabled { cursor: default; opacity: .55; }
+button:focus-visible, summary:focus-visible, input:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.scope, .actions, .query { display: flex; align-items: center; gap: 5px; }
+.scope { color: var(--vscode-descriptionForeground); margin-bottom: 8px; }
+.scope button { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--vscode-textLink-foreground); }
+.query, input[type=text] { width: 100%; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); border-radius: 2px; }
+input[type=text] { padding: 4px 6px; min-width: 0; height: 27px; }
+input::placeholder { color: var(--vscode-input-placeholderForeground); }
+.query { gap: 1px; padding-right: 3px; margin-bottom: 4px; }
+.query:focus-within { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.query input { border: 0; background: transparent; outline: 0; }
+.toggle { height: 22px; min-width: 24px; padding: 1px 3px; font-weight: 600; }
+.toggle[aria-pressed=true] { color: var(--vscode-inputOption-activeForeground); background: var(--vscode-inputOption-activeBackground); border-color: var(--vscode-inputOption-activeBorder); }
+.toggle:hover, .tool:hover, .result:hover { background: var(--vscode-toolbar-hoverBackground); }
+details { margin: 8px 0; }
+summary { color: var(--vscode-descriptionForeground); }
+label { display: block; margin: 8px 0 4px; }
+input[type=checkbox] { margin: 0; vertical-align: -2px; accent-color: var(--vscode-focusBorder); }
+.actions { flex-wrap: wrap; margin: 9px 0 10px; }
+.primary, .secondary { padding: 4px 8px; }
+.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+.primary:enabled:hover { background: var(--vscode-button-hoverBackground); }
+.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+.secondary:enabled:hover { background: var(--vscode-button-secondaryHoverBackground); }
+.tool { margin-left: auto; font-size: 18px; }
+#notice, #status { margin: 6px 0; overflow-wrap: anywhere; color: var(--vscode-descriptionForeground); }
+#notice.error, #status.error { color: var(--vscode-errorForeground); }
+#results:not(:empty) { margin: 9px -6px; border-top: 1px solid var(--vscode-panel-border); }
+.result { width: 100%; padding: 7px 5px; display: block; text-align: left; border-bottom: 1px solid var(--vscode-panel-border); }
+.path, .destination, .snippet { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.path { font-weight: 600; }
+.destination { color: var(--vscode-textLink-foreground); margin: 2px 0; }
+.snippet { font: var(--vscode-editor-font-size) var(--vscode-editor-font-family); white-space: pre; padding: 1px 3px; }
+.before { background: var(--vscode-diffEditor-removedTextBackground); }
+.after { background: var(--vscode-diffEditor-insertedTextBackground); }
