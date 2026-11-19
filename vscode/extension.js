@@ -29,6 +29,21 @@ function validQuery(q) {
     ['regex', 'exact', 'substring', 'ignored', 'deleting'].every(k => typeof q[k] === 'boolean');
 }
 
+async function findPython(cwd) {
+  if (process.platform !== 'win32') return 'python3';
+  for (const command of [['py', '-3'], ['python'], ['python3']]) {
+    const [exe, ...prefix] = command;
+    try {
+      // Probe before launching the engine so a failed mutation is never retried.
+      const {stdout} = await execute(exe, [...prefix, '-I', '-X', 'utf8', '-c',
+        'import sys; print(sys.executable if sys.version_info >= (3, 9) else "")'],
+      {cwd, encoding: 'utf8', windowsHide: true, timeout: 10000});
+      if (path.isAbsolute(stdout.trim())) return stdout.trim();
+    } catch { /* Try the next launcher on PATH. */ }
+  }
+  throw new Error('Install Python 3.9 or newer and make py or python available to VS Code.');
+}
+
 async function protectBuffers(folder, rows) {
   const documents = [...vscode.workspace.textDocuments, ...vscode.workspace.notebookDocuments]
     .filter(d => d.isDirty && d.uri.scheme === 'file');
@@ -38,8 +53,10 @@ async function protectBuffers(folder, rows) {
     const file = await fs.promises.realpath(doc.uri.fsPath).catch(() => path.resolve(doc.uri.fsPath));
     if (!inside(root, file)) continue;
     const relative = path.relative(root, file);
-    if (!rows || rows.some(row => [row.path, row.final].some(
-      entry => entry === relative || (row.directory && inside(entry, relative))))) {
+    if (!rows || rows.some(row => [row.path, row.final].some(entry => {
+      const target = path.resolve(root, entry);
+      return path.relative(target, file) === '' || (row.directory && inside(target, file));
+    }))) {
       throw new Error('Save or revert the unsaved changes in ' + relative + ' before continuing.');
     }
   }
@@ -125,16 +142,21 @@ class SearchView {
 
   async run(action, folder, q, options = [], signal) {
     if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace to use Mega Replace.');
-    if (!['darwin', 'linux'].includes(process.platform)) throw new Error('The rename engine requires macOS or Linux.');
+    if (!['darwin', 'linux', 'win32'].includes(process.platform)) throw new Error('Unsupported operating system.');
     const script = this.context.asAbsolutePath('mega-rename');
     const args = ['-I', '-X', 'utf8', script, action, ...options, ...(q ? flags(q) : []), '--', folder.fsPath];
     if (q) args.push(q.find, q.replace);
     try {
-      const {stdout} = await execute('python3', args, {cwd: this.context.extensionPath, encoding: 'utf8',
-        signal, maxBuffer: 96 * 1024 * 1024});
+      this.python ??= await findPython(this.context.extensionPath);
+      const {stdout} = await execute(this.python, args, {cwd: this.context.extensionPath, encoding: 'utf8',
+        windowsHide: true, signal, maxBuffer: 96 * 1024 * 1024});
       return action === 'undo' ? stdout.trim() : JSON.parse(stdout);
     } catch (error) {
-      if (error.code === 'ENOENT') throw new Error('Install Python 3.9 or newer and make python3 available to VS Code.');
+      if (error.code === 'ENOENT') {
+        this.python = undefined;
+        const name = process.platform === 'win32' ? 'py or python' : 'python3';
+        throw new Error('Install Python 3.9 or newer and make ' + name + ' available to VS Code.');
+      }
       if (error.stderr) throw new Error(error.stderr.trim().replace(/^mega-rename: /, ''));
       throw error;
     }
@@ -238,4 +260,4 @@ function activate(context) {
     {dispose: () => search.invalidate()}
   );
 }
-module.exports = {activate};
+module.exports = {activate, SearchView};

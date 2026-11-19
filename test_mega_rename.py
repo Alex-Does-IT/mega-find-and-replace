@@ -29,8 +29,8 @@ class SweepTests(unittest.TestCase):
         self.root.mkdir()
 
     def run_cli(self, action, *args, success=True):
-        cmd = [sys.executable, SCRIPT, action, self.root, *args]
-        run = subprocess.run(cmd, capture_output=True, text=True)
+        cmd = [sys.executable, '-X', 'utf8', SCRIPT, action, self.root, *args]
+        run = subprocess.run(cmd, capture_output=True, encoding='utf-8')
         self.assertEqual(run.returncode == 0, success, (cmd, run.stdout, run.stderr))
         return run.stdout if success else run.stderr
 
@@ -84,7 +84,7 @@ class SweepTests(unittest.TestCase):
         self.run_cli('apply', 'Bob', 'Martin')
         dst = self.root / 'Martin/MartinPlugins/Martin.txt'
         self.assertEqual(dst.read_bytes(), expected)
-        self.assertEqual(stat.S_IMODE(dst.stat().st_mode), 0o751)
+        self.assertEqual(stat.S_IMODE(dst.stat().st_mode), stat.S_IMODE(before.st_mode))
         self.assertTrue((self.root / 'MartinEmpty').is_dir())
         self.assertTrue((self.root / 'BobLink').is_symlink())
         self.assertEqual(outside.read_bytes(), b'Bob')
@@ -195,13 +195,14 @@ class SweepTests(unittest.TestCase):
         os.link(ext, self.root / 'ref')
         src = self.file('utf16', codecs.BOM_UTF16_BE + 'Bob\r\n'.encode('utf-16-be'))
         src.chmod(0o440)
+        mode = stat.S_IMODE(src.stat().st_mode)
         self.run_cli('apply', 'Bob', 'Martin')
         self.assertEqual((self.root / 'Martin.bin').read_bytes(), binary)
         self.assertEqual((self.root / 'Martin.pdf').read_bytes(), b'%PDF-1.4 Bob')
         self.assertEqual(ext.read_bytes(), b'Bob')
         self.assertEqual((self.root / 'ref').read_bytes(), b'Martin')
         self.assertEqual(src.read_bytes(), codecs.BOM_UTF16_BE + 'Martin\r\n'.encode('utf-16-be'))
-        self.assertEqual(stat.S_IMODE(src.stat().st_mode), 0o440)
+        self.assertEqual(stat.S_IMODE(src.stat().st_mode), mode)
         self.run_cli('undo')
         self.assertTrue(ext.samefile(self.root / 'ref'))
 
@@ -290,7 +291,7 @@ class SweepTests(unittest.TestCase):
         self.run_cli('apply', 'Bob', '../elsewhere', '--literal', success=False)
         outside = self.tmp / 'metadata'
         outside.mkdir()
-        (self.root / sweep.STATE).symlink_to(outside)
+        (self.root / sweep.STATE).symlink_to(outside, target_is_directory=True)
         self.run_cli('apply', 'Bob', 'Martin', success=False)
         self.assertEqual(src.read_bytes(), b'Bob')
         self.assertEqual(list(outside.iterdir()), [])
@@ -342,6 +343,58 @@ class SweepTests(unittest.TestCase):
             sweep.restore(self.root, session)
         self.run_cli('undo')
         self.assertEqual(src.read_bytes(), b'Bob')
+
+    def test_second_process_cannot_sweep_a_locked_root(self):
+        src = self.file('Bob.txt', b'Bob')
+        with sweep.locked(self.root):
+            self.assertIn('Another sweep', self.run_cli('apply', 'Bob', 'Martin', success=False))
+        self.assertEqual(src.read_bytes(), b'Bob')
+        self.assertFalse((self.root / sweep.STATE).exists())
+        self.run_cli('apply', 'Bob', 'Martin')
+
+    def test_windows_component_rules(self):
+        for name in ('NUL.txt', 'CON', 'COM¹.csv', 'file.', 'file ', 'a:b', 'a\\b', 'x?', 'a' * 256):
+            self.assertFalse(sweep.valid_windows_name(name), name)
+        for name in ('null.txt', 'com10.txt', 'a' * 255, 'résumé.md'):
+            self.assertTrue(sweep.valid_windows_name(name), name)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows path and stream semantics')
+    def test_windows_filename_validation_and_stream_preservation(self):
+        src = self.file('Bob.cmd', b'Bob\r\n')
+        stream = Path(str(src) + ':example')
+        stream.write_bytes(b'original stream')
+        for target in ('NUL', 'AUX.txt', 'Martin:', 'Martin.', 'Martin '):
+            self.run_cli('apply', 'Bob.cmd', target, '--literal', success=False)
+        for token in ('tree/C:escape', 'tree/..\\outside', 'tree/file:stream', 'tree/NUL'):
+            with self.assertRaises(sweep.Problem):
+                sweep.location(self.root, None, token)
+        self.assertFalse((self.root / sweep.STATE).exists())
+        self.run_cli('apply', 'Bob', 'Martin')
+        self.assertEqual((self.root / 'Martin.cmd:example').read_bytes(), b'original stream')
+        self.run_cli('undo')
+        self.assertEqual(stream.read_bytes(), b'original stream')
+        self.assertEqual(src.read_bytes(), b'Bob\r\n')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows directory junction')
+    def test_windows_junction_stays_outside_sweep_and_journal(self):
+        outside = self.tmp / 'other'
+        outside.mkdir()
+        ref = outside / 'Bob.txt'
+        ref.write_bytes(b'Bob')
+        self.file('Bob.txt', b'Bob')
+        def junction(path):
+            subprocess.run(['cmd.exe', '/d', '/c', 'mklink', '/J', str(path), str(outside)],
+                           check=True, capture_output=True)
+        junction(self.root / 'BobLink')
+        self.run_cli('apply', 'Bob', 'Martin')
+        self.assertTrue((self.root / 'BobLink').is_dir())
+        self.assertEqual(ref.read_bytes(), b'Bob')
+        self.run_cli('undo')
+        (self.root / 'BobLink').rmdir()
+        sweep.remove_session(self.root / sweep.STATE)
+        junction(self.root / sweep.STATE)
+        self.run_cli('apply', 'Bob', 'Martin', success=False)
+        self.assertEqual(list(outside.iterdir()), [ref])
 
 
 if __name__ == '__main__':

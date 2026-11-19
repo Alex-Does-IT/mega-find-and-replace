@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Preview, apply and undo a case-aware project rename. Created by Alex Does IT LLC. Requires Python 3.9+."""
+"""Preview, apply and undo a case-aware project rename. Requires Python 3.9+. Windows support is experimental."""
 from __future__ import annotations
 
 import argparse
 import codecs
 import ctypes
 import difflib
-import fcntl
 import fnmatch
 import hashlib
 import io
@@ -26,6 +25,11 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from itertools import zip_longest
 from pathlib import Path
+
+if os.name == "nt":
+    from ctypes import wintypes
+else:
+    import fcntl
 
 STATE = ".mega-rename"
 PROTECTED = {STATE, ".git", ".hg", ".svn"}
@@ -289,7 +293,49 @@ def ignored_by_git(root):
 
 
 def identity(st):
+    if os.name == "nt" and not st.st_ino:
+        raise Problem("This volume does not provide the file IDs required for a safe sweep.")
     return (st.st_dev, st.st_ino)
+
+
+def is_link(st):
+    # Windows junctions and other reparse points need not have symlink mode bits.
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & 0x400)
+
+
+def plain_directory(path):
+    st = path.lstat()
+    return (stat.S_ISDIR(st.st_mode) and not is_link(st) and
+            not os.path.ismount(path) and path not in linux_mounts())
+
+
+def valid_windows_name(name):
+    if (not name or name.endswith((" ", ".")) or re.search(r'[<>:"/\\|?*\x00-\x1f]', name)
+            or len(name.encode("utf-16-le", "surrogatepass")) > 510):
+        return False
+    stem = name.partition(".")[0].rstrip(" ").upper()
+    return not re.fullmatch(r"CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|(?:COM|LPT)[0-9¹²³]", stem)
+
+
+def valid_destination(folder, name):
+    if name in ("", ".", "..") or name_key(name) in PROTECTED:
+        return False
+    if os.name == "nt":
+        return valid_windows_name(name)
+    return len(os.fsencode(name)) <= os.pathconf(folder, "PC_NAME_MAX")
+
+
+def check_windows_root(directory):
+    if directory.drive.startswith("\\\\"):
+        raise Problem("Experimental Windows support requires a local drive.")
+    # Avoid silently resolving a selected junction into another project.
+    for part in (directory, *directory.parents):
+        if is_link(part.lstat()):
+            raise Problem(f"Choose the actual project folder instead of a reparse point: {str(part)!r}")
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
+    if kernel.GetDriveTypeW(directory.anchor) == 4:  # DRIVE_REMOTE
+        raise Problem("Experimental Windows support requires a local drive.")
 
 
 @lru_cache(maxsize=1)
@@ -368,10 +414,10 @@ def scan(root, rewrite, args):
             skip = None
             if name_key(name) in PROTECTED:
                 skip = "metadata"
-            elif stat.S_ISLNK(st.st_mode):
+            elif is_link(st):
                 skip = "symlink"
             elif (st.st_dev != root_dev or path in linux_mounts()
-                  or (stat.S_ISDIR(st.st_mode) and path.is_mount())):
+                  or (stat.S_ISDIR(st.st_mode) and os.path.ismount(path))):
                 skip = "mount"
             elif not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
                 skip = "special"
@@ -388,12 +434,11 @@ def scan(root, rewrite, args):
             else:
                 find_only = args.action == "preview" and args.find_only
                 new = name if find_only else rewrite(name)
-                if new != name and (new in ("", ".", "..") or name_key(new) in PROTECTED
-                                    or (args.regex and re.search(r"[/\\\x00-\x1f\x7f]", new))
-                                    or len(os.fsencode(new)) > os.pathconf(folder, "PC_NAME_MAX")):
+                if new != name and (not valid_destination(folder, new)
+                                    or (args.regex and re.search(r"[/\\\x00-\x1f\x7f]", new))):
                     raise Problem(f"Invalid destination {new!r} for {str(rel)!r}")
                 final = final_parent / new
-                row = {"path": str(rel), "final": str(final), "directory": stat.S_ISDIR(st.st_mode)}
+                row = {"path": rel.as_posix(), "final": final.as_posix(), "directory": stat.S_ISDIR(st.st_mode)}
                 if find_only and next(rewrite.matches(name), None) is not None:
                     row["nameMatch"] = True
                 if stat.S_ISDIR(st.st_mode):
@@ -417,7 +462,7 @@ def scan(root, rewrite, args):
                         if args.diff:
                             for line in difflib.unified_diff(result[0].splitlines(True),
                                                              result[1].splitlines(True),
-                                                             repr(str(rel)), repr(str(final))):
+                                                             repr(rel.as_posix()), repr(final.as_posix())):
                                 print(line.rstrip("\r\n"))
                 if new != name:
                     plan.renames.append((rel, new, final, identity(st)))
@@ -438,6 +483,9 @@ def scan(root, rewrite, args):
 
 
 def exclusive_move(source, target):
+    if os.name == "nt":
+        os.rename(source, target)  # MoveFileExW without MOVEFILE_REPLACE_EXISTING.
+        return
     # rename(2) normally overwrites an existing destination, even after a preflight.
     libc = ctypes.CDLL(None, use_errno=True)
     a, b = os.fsencode(source), os.fsencode(target)
@@ -454,6 +502,33 @@ def exclusive_move(source, target):
 
 @contextmanager
 def locked(root):
+    if os.name == "nt":
+        # A named mutex is shared across processes, survives directory aliases, and
+        # is released by Windows if its owner exits. A preview needs no lockfile.
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        create = kernel.CreateMutexW
+        create.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        create.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.ReleaseMutex.argtypes = kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        dev, ino = identity(root.stat())
+        handle = create(None, False, f"Global\\MegaFindAndReplace-{dev:x}-{ino:x}")
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            wait = kernel.WaitForSingleObject(handle, 0)
+            if wait == 258:  # WAIT_TIMEOUT
+                raise Problem(f"Another sweep is using {str(root)!r}.")
+            if wait not in (0, 0x80):  # WAIT_OBJECT_0 or WAIT_ABANDONED
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                yield
+            finally:
+                kernel.ReleaseMutex(handle)
+        finally:
+            kernel.CloseHandle(handle)
+        return
     fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     try:
         try:
@@ -479,8 +554,8 @@ def storage(root, create=False):
             (fresh / ".gitignore").write_text("*\n")
             (fresh / "format").write_bytes(MAGIC)
             exclusive_move(fresh, area)
-    if (area.is_symlink() or not area.is_dir() or area.is_mount() or area in linux_mounts() or marker.is_symlink()
-            or not marker.is_file() or marker.read_bytes() != MAGIC):
+    if (not plain_directory(area) or not marker.is_file() or is_link(marker.lstat())
+            or marker.read_bytes() != MAGIC):
         raise Problem(f"Reserved path already in use: {str(area)!r}")
     return area
 
@@ -488,7 +563,7 @@ def storage(root, create=False):
 def latest(area):
     if area:
         for folder in sorted(area.glob("run-*"), reverse=True):
-            if folder.is_symlink() or not folder.is_dir() or folder.is_mount() or folder in linux_mounts():
+            if not plain_directory(folder):
                 raise Problem(f"Invalid transaction folder {str(folder)!r}")
             return folder
     return None
@@ -496,7 +571,7 @@ def latest(area):
 
 def journal_file(session, filename):
     path = session / filename
-    if path.is_symlink() or not path.is_file():
+    if not path.is_file() or is_link(path.lstat()):
         raise Problem(f"Missing or invalid journal file {str(path)!r}")
     return path
 
@@ -514,7 +589,8 @@ def status(session, phase=None, count=0):
 def location(root, session, token):
     kind, sep, value = token.partition("/")
     parts = value.split("/")
-    if not sep or any(p in ("", ".", "..") for p in parts):
+    if (not sep or any(p in ("", ".", "..") for p in parts)
+            or (os.name == "nt" and not all(valid_windows_name(p) for p in parts))):
         raise Problem(f"Invalid journal path {token!r}")
     if kind == "save" and re.fullmatch(r"(before|after|move)-[0-9]+", value):
         return session / value
@@ -523,8 +599,10 @@ def location(root, session, token):
     parent = root
     for component in parts[:-1]:
         parent = parent / component
-        if parent.is_symlink() or not parent.is_dir() or parent in linux_mounts() or parent.is_mount():
+        if not plain_directory(parent):
             raise Problem(f"Directory changed: {str(parent)!r}")
+        if os.name == "nt" and "~" in component and name_key(parent.resolve(strict=True).name) in PROTECTED:
+            raise Problem(f"Invalid journal path {token!r}")
     return parent / parts[-1]
 
 
@@ -533,7 +611,8 @@ def matches(path, ident):
         st = path.lstat()
     except FileNotFoundError:
         return False
-    return identity(st) == tuple(ident) and (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode))
+    return (not is_link(st) and identity(st) == tuple(ident)
+            and (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)))
 
 
 def check_hash(path, expected):
@@ -552,21 +631,84 @@ def transfer(root, session, move, reverse=False):
     exclusive_move(source, target)
 
 
+def copy_for_edit(path, stage):
+    if os.name != "nt":
+        cmd = ["cp", "-p"] if sys.platform == "darwin" else ["cp", "--preserve=all"]
+        subprocess.run(cmd + [path, stage], check=True)
+        original, staged = path.lstat(), stage.lstat()
+        if (original.st_uid, original.st_gid) != (staged.st_uid, staged.st_gid):
+            raise Problem(f"Cannot preserve file ownership for {str(path)!r}")
+        return
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CopyFileW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.BOOL]
+    if not kernel.CopyFileW(str(path), str(stage), True):  # Includes NTFS data streams.
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    # A copy can inherit permissions from its staging directory. Retain the
+    # source owner, group and DACL before any of the user's files are moved.
+    security = ctypes.WinDLL("advapi32", use_last_error=True)
+    security.GetFileSecurityW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p,
+                                          wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    security.SetFileSecurityW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
+    security.GetSecurityDescriptorControl.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.WORD),
+                                                       ctypes.POINTER(wintypes.DWORD)]
+
+    def descriptor(file, field):
+        size = wintypes.DWORD()
+        security.GetFileSecurityW(str(file), field, None, 0, ctypes.byref(size))
+        if not size.value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        data = ctypes.create_string_buffer(size.value)
+        if not security.GetFileSecurityW(str(file), field, data, size, ctypes.byref(size)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return data.raw
+
+    for field in (1, 2, 4):  # OWNER, GROUP, DACL_SECURITY_INFORMATION
+        desired = descriptor(path, field)
+        if descriptor(stage, field) == desired:
+            continue
+        flags = field
+        if field == 4:
+            control, revision = wintypes.WORD(), wintypes.DWORD()
+            if not security.GetSecurityDescriptorControl(desired, ctypes.byref(control), ctypes.byref(revision)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            flags |= 0x80000000 if control.value & 0x1000 else 0x20000000
+        if not security.SetFileSecurityW(str(stage), flags, desired):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if descriptor(stage, field) != desired:
+            raise Problem(f"Cannot preserve the Windows security descriptor for {str(path)!r}")
+
+
+def output_mode(path):
+    mode = stat.S_IMODE(path.stat().st_mode)
+    # Windows synthesizes executable bits from the filename extension.
+    return mode & stat.S_IWRITE if os.name == "nt" else mode
+
+
+def remove_session(folder):
+    def retry_readonly(func, path, error):
+        st = os.lstat(path)
+        if (os.name == "nt" and func in (os.unlink, os.remove) and not is_link(st)
+                and isinstance(error[1], PermissionError) and not st.st_mode & stat.S_IWRITE):
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        else:
+            raise error[1]
+    shutil.rmtree(folder, onerror=retry_readonly)
+
+
 def prepare(root, area, plan, rewrite):
     work = Path(tempfile.mkdtemp(prefix="stage-", dir=area))
     moves, outputs, renamed, edited = [], [], [], {}
     try:
         for i, (rel, final, ident, old_hash, new_hash) in enumerate(plan.edits):
-            path = location(root, work, f"tree/{rel}")
+            source = "tree/" + rel.as_posix()
+            path = location(root, work, source)
             if not matches(path, ident):
                 raise Problem(f"File replaced since preview: {str(path)!r}")
             stage = work / f"after-{i}"
-            # cp preserves POSIX modes and macOS extended metadata on this private copy.
-            cmd = ["cp", "-p"] if sys.platform == "darwin" else ["cp", "--preserve=all"]
-            subprocess.run(cmd + [path, stage], check=True)
-            original_stat, staged_stat = path.lstat(), stage.lstat()
-            if (original_stat.st_uid, original_stat.st_gid) != (staged_stat.st_uid, staged_stat.st_gid):
-                raise Problem(f"Cannot preserve file ownership for {str(path)!r}")
+            copy_for_edit(path, stage)
             data = stage.read_bytes()
             if digest(data) != old_hash:
                 raise Problem(f"File changed since preview: {str(path)!r}")
@@ -579,21 +721,21 @@ def prepare(root, area, plan, rewrite):
             stage.write_bytes(result[2])
             stage.chmod(mode & ~(stat.S_ISUID | stat.S_ISGID))
             new_ident = identity(stage.stat())
-            moves.extend([(f"tree/{rel}", f"save/before-{i}", ident, old_hash),
-                          (f"save/after-{i}", f"tree/{rel}", new_ident, new_hash)])
-            outputs.append((f"tree/{final}", new_ident, new_hash, stat.S_IMODE(stage.stat().st_mode)))
+            moves.extend([(source, f"save/before-{i}", ident, old_hash),
+                          (f"save/after-{i}", source, new_ident, new_hash)])
+            outputs.append(("tree/" + final.as_posix(), new_ident, new_hash, output_mode(stage)))
             edited[rel] = new_ident
         # Children move before their parents. Case-only renames need a temporary
         # name so each operation has two distinct endpoints on all supported volumes.
         for i, (rel, new, final, ident) in enumerate(plan.renames):
             ident = edited.get(rel, ident)
-            source = f"tree/{rel}"
+            source = "tree/" + rel.as_posix()
             if name_key(rel.name) == name_key(new):
                 hold = f"save/move-{i}"
                 moves.append((source, hold, ident, None))
                 source = hold
-            moves.append((source, f"tree/{rel.with_name(new)}", ident, None))
-            renamed.append((f"tree/{final}", rel.name, ident))
+            moves.append((source, "tree/" + rel.with_name(new).as_posix(), ident, None))
+            renamed.append(("tree/" + final.as_posix(), rel.name, ident))
         (work / "manifest").write_text(json.dumps({"root": identity(root.stat()),
                                                    "moves": moves, "outputs": outputs,
                                                    "renamed": renamed}))
@@ -601,7 +743,7 @@ def prepare(root, area, plan, rewrite):
         session = area / f"run-{time.time_ns():020d}-{work.name[6:]}"
         exclusive_move(work, session)
     except BaseException:
-        shutil.rmtree(work)
+        remove_session(work)
         raise
     return session, moves
 
@@ -624,6 +766,8 @@ def restore(root, session):
                 check_hash(backup, checksum)
         for token, original_name, ident in manifest["renamed"]:
             path = location(root, session, token)
+            if os.name == "nt" and not valid_destination(path.parent, original_name):
+                raise Problem(f"Invalid original filename {original_name!r}")
             if not matches(path, ident):
                 raise Problem(f"Renamed entry has moved or been replaced: {str(path)!r}")
             check_destination(path, path.with_name(original_name))
@@ -632,7 +776,7 @@ def restore(root, session):
             if not matches(path, ident):
                 raise Problem(f"Edited file has moved or been replaced: {str(path)!r}")
             check_hash(path, checksum)
-            if stat.S_IMODE(path.stat().st_mode) != mode:
+            if output_mode(path) != mode:
                 raise Problem(f"File permissions changed since the sweep: {str(path)!r}")
     status(session, "undoing", count)
     while count:
@@ -642,7 +786,7 @@ def restore(root, session):
     # Once removed from the run stack this transaction has been completely undone.
     retired = session.with_name("done-" + session.name)
     exclusive_move(session, retired)
-    shutil.rmtree(retired)
+    remove_session(retired)
 
 
 def apply(root, plan, rewrite):
@@ -695,7 +839,10 @@ def main():
                          help="also scan Git-ignored and common dependency/cache paths")
         sub.add_argument("--max-mib", type=int, default=16, help="content size limit per file (default 16 MiB)")
     args = parser.parse_args()
-    root = args.directory.expanduser().resolve(strict=True)
+    directory = args.directory.expanduser().absolute()
+    if os.name == "nt":
+        check_windows_root(directory)
+    root = directory.resolve(strict=True)
     if not root.is_dir() or any(name_key(p) in PROTECTED for p in root.parts):
         raise Problem("Select a project directory outside version-control and sweep metadata.")
     with locked(root):
@@ -722,7 +869,7 @@ def main():
         if args.action == "preview" and args.render_file:
             path = location(root, None, "tree/" + args.render_file)
             st = path.lstat()
-            if (not stat.S_ISREG(st.st_mode) or st.st_size > args.max_mib * 1024 * 1024
+            if (is_link(st) or not stat.S_ISREG(st.st_mode) or st.st_size > args.max_mib * 1024 * 1024
                     or st.st_dev != root.stat().st_dev or path in linux_mounts()):
                 raise Problem("This previewed file has changed. Refresh the results.")
             data = path.read_bytes()

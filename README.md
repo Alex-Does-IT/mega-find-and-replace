@@ -11,11 +11,13 @@ Rename files, folders, and the text that refers to them in one pass. Suppose `Bo
 
 The same rule works for multiword names. Rename `JobQueue` to `WorkerPool` and `job_queue_size` becomes `worker_pool_size`, while `job-queue` becomes `worker-pool`.
 
-The extension and CLI run on **macOS and Linux** with **Python 3.9+** available as `python3`. Linux also requires GNU `cp` and `renameat2`.
+The extension and CLI require **Python 3.9+**. On macOS and Linux, make `python3` available on your PATH. Linux also requires GNU `cp` and `renameat2`.
+
+**Windows support is experimental.** Use a local NTFS project folder. The extension looks for Python through `py -3`, `python`, or `python3`. Junctions and other reparse points are skipped. If another program has a file open and Windows refuses the rename, close that file and preview the sweep again.
 
 ## In VS Code
 
-**1. Open Mega Replace.** With your project open, press **Cmd+Shift+P** on macOS or **Ctrl+Shift+P** on Linux to open the Command Palette. Run **Mega Replace: Find and Replace**. [Install from the Marketplace](https://marketplace.visualstudio.com/items?itemName=alexdoesitllc.mega-find-and-replace) · [Download a VSIX](https://github.com/Alex-Does-IT/mega-find-and-replace/releases/latest)
+**1. Open Mega Replace.** With your project open, press **Cmd+Shift+P** on macOS or **Ctrl+Shift+P** on Windows or Linux to open the Command Palette. Run **Mega Replace: Find and Replace**. [Install from the Marketplace](https://marketplace.visualstudio.com/items?itemName=alexdoesitllc.mega-find-and-replace) · [Download a VSIX](https://github.com/Alex-Does-IT/mega-find-and-replace/releases/latest)
 
 ![VS Code Command Palette with Mega Replace: Find and Replace selected](docs/images/command-palette.png)
 
@@ -34,6 +36,14 @@ Clone this repo and preview the same rename in a neighboring project.
 ```
 
 When the diff looks right, run `./mega-rename apply ../my-project Bob Martin`. To roll it back, run `./mega-rename undo ../my-project`.
+
+In Windows PowerShell, run the script through Python. If your installation provides `python`, use that in place of `py -3`.
+
+```powershell
+py -3 .\mega-rename preview '..\my-project' Bob Martin --diff
+py -3 .\mega-rename apply '..\my-project' Bob Martin
+py -3 .\mega-rename undo '..\my-project'
+```
 
 By default, `Bob` matches the capitalized word in `getBob` and skips `bobcat`. Add `--substring` if you want `martincat` too. Use `--literal` for exact text or `--regex` for Python patterns with captures such as `$1`. See `./mega-rename preview --help` for matching and exclusion options.
 

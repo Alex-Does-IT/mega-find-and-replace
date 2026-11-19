@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.0
+
+Added experimental Windows support to the VS Code extension and CLI. Preview, apply, and undo sweeps on local NTFS projects, including case-only renames. The engine skips junctions and rejects reserved Windows filenames before making changes.
+
 ## 0.1.7
 
 Added a screenshot walkthrough of a `Bob` → `Martin` rename, including the Command Palette shortcuts, folder scope, and diff preview.

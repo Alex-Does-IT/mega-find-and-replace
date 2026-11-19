@@ -1,0 +1,30 @@
+name: Windows
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest -v
+      - uses: actions/setup-node@v4
+        if: matrix.python == '3.13'
+        with:
+          node-version: '24'
+      - name: Exercise the VS Code desktop extension
+        if: matrix.python == '3.13'
+        shell: pwsh
+        run: |
+          npm install --prefix "$env:RUNNER_TEMP/mega-tests" --no-audit --no-fund @vscode/test-electron@3.1.0
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $env:NODE_PATH = "$env:RUNNER_TEMP/mega-tests/node_modules"
+          node -e "require('@vscode/test-electron').runTests({extensionDevelopmentPath: process.cwd(), extensionTestsPath: require.resolve('./test/extension-host'), launchArgs: ['--disable-extensions','--disable-workspace-trust','--disable-gpu']}).catch(e => { console.error(e); process.exitCode = 1 })"
