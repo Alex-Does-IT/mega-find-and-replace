@@ -675,6 +675,7 @@ def copy_for_edit(path, stage):
     security.SetFileSecurityW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
     security.GetSecurityDescriptorControl.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.WORD),
                                                        ctypes.POINTER(wintypes.DWORD)]
+    security.SetSecurityDescriptorControl.argtypes = [ctypes.c_void_p, wintypes.WORD, wintypes.WORD]
     to_string = security.ConvertSecurityDescriptorToStringSecurityDescriptorW
     to_string.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
                           ctypes.POINTER(wintypes.LPWSTR), ctypes.c_void_p]
@@ -688,7 +689,7 @@ def copy_for_edit(path, stage):
         data = ctypes.create_string_buffer(size.value)
         if not security.GetFileSecurityW(str(file), field, data, size, ctypes.byref(size)):
             raise ctypes.WinError(ctypes.get_last_error())
-        return data.raw
+        return data
 
     def field_value(data, field):
         # Self-relative descriptor headers can carry unrelated control flags.
@@ -712,17 +713,60 @@ def copy_for_edit(path, stage):
             if not security.GetSecurityDescriptorControl(desired, ctypes.byref(control), ctypes.byref(revision)):
                 raise ctypes.WinError(ctypes.get_last_error())
             flags |= 0x80000000 if control.value & 0x1000 else 0x20000000
+            if control.value & 0x0400:  # Preserve SE_DACL_AUTO_INHERITED when Windows installs the ACL.
+                if not security.SetSecurityDescriptorControl(desired, 0x0100, 0x0100):
+                    raise ctypes.WinError(ctypes.get_last_error())
         if not security.SetFileSecurityW(str(stage), flags, desired):
             raise ctypes.WinError(ctypes.get_last_error())
-        if field_value(descriptor(stage, field), field) != desired_value:
+        actual = field_value(descriptor(stage, field), field)
+        if actual != desired_value:
             field_name = {1: "owner", 2: "group", 4: "DACL"}[field]
-            raise Problem(f"Cannot preserve the Windows {field_name} for {str(path)!r}")
+            detail = ""
+            if field == 4:
+                wanted_flags, _, wanted_aces = desired_value.partition("(")
+                got_flags, _, got_aces = actual.partition("(")
+                detail = f" (flags {wanted_flags} -> {got_flags}, access entries match: {wanted_aces == got_aces})"
+            raise Problem(f"Cannot preserve the Windows {field_name} for {str(path)!r}{detail}")
 
 
 def output_mode(path):
     mode = stat.S_IMODE(path.stat().st_mode)
     # Windows synthesizes executable bits from the filename extension.
     return mode & stat.S_IWRITE if os.name == "nt" else mode
+
+
+def windows_stream_hashes(path):
+    class StreamData(ctypes.Structure):
+        _fields_ = [("size", ctypes.c_longlong), ("name", wintypes.WCHAR * 296)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.FindFirstStreamW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                         ctypes.POINTER(StreamData), wintypes.DWORD]
+    kernel.FindFirstStreamW.restype = wintypes.HANDLE
+    kernel.FindNextStreamW.argtypes = [wintypes.HANDLE, ctypes.POINTER(StreamData)]
+    kernel.FindClose.argtypes = [wintypes.HANDLE]
+    info = StreamData()
+    streams = {}
+    handle = kernel.FindFirstStreamW(str(path), 0, ctypes.byref(info), 0)
+    if handle == ctypes.c_void_p(-1).value:
+        if ctypes.get_last_error() == 38:  # ERROR_HANDLE_EOF
+            return streams
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        while True:
+            if info.name != "::$DATA":
+                checksum = hashlib.sha256()
+                with open(str(path) + info.name, "rb") as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        checksum.update(block)
+                streams[info.name] = checksum.hexdigest()
+            if not kernel.FindNextStreamW(handle, ctypes.byref(info)):
+                if ctypes.get_last_error() != 38:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                break
+    finally:
+        kernel.FindClose(handle)
+    return streams
 
 
 def remove_session(folder):
@@ -740,6 +784,7 @@ def remove_session(folder):
 def prepare(root, area, plan, rewrite):
     work = Path(tempfile.mkdtemp(prefix="stage-", dir=area))
     moves, outputs, renamed, edited = [], [], [], {}
+    streams = {}
     try:
         for i, (rel, final, ident, old_hash, new_hash) in enumerate(plan.edits):
             source = "tree/" + rel.as_posix()
@@ -764,6 +809,12 @@ def prepare(root, area, plan, rewrite):
                 output.truncate()
             stage.chmod(mode & ~(stat.S_ISUID | stat.S_ISGID))
             new_ident = identity(stage.stat())
+            if os.name == "nt":
+                original_streams = windows_stream_hashes(path)
+                if original_streams != windows_stream_hashes(stage):
+                    raise Problem(f"Alternate data streams changed while staging {str(path)!r}")
+                if original_streams:
+                    streams[f"save/before-{i}"] = streams["tree/" + final.as_posix()] = original_streams
             moves.extend([(source, f"save/before-{i}", ident, old_hash),
                           (f"save/after-{i}", source, new_ident, new_hash)])
             outputs.append(("tree/" + final.as_posix(), new_ident, new_hash, output_mode(stage)))
@@ -781,7 +832,7 @@ def prepare(root, area, plan, rewrite):
             renamed.append(("tree/" + final.as_posix(), rel.name, ident))
         (work / "manifest").write_text(json.dumps({"root": identity(root.stat()),
                                                    "moves": moves, "outputs": outputs,
-                                                   "renamed": renamed}))
+                                                   "renamed": renamed, "streams": streams}))
         status(work, "applying", 0)
         session = area / f"run-{time.time_ns():020d}-{work.name[6:]}"
         exclusive_move(work, session)
@@ -807,6 +858,8 @@ def restore(root, session):
                 if not matches(backup, ident):
                     raise Problem(f"Original file missing from journal: {str(backup)!r}")
                 check_hash(backup, checksum)
+                if os.name == "nt" and windows_stream_hashes(backup) != manifest["streams"].get(target, {}):
+                    raise Problem(f"Alternate data streams changed in the journal: {str(backup)!r}")
         for token, original_name, ident in manifest["renamed"]:
             path = location(root, session, token)
             if os.name == "nt" and not valid_destination(path.parent, original_name):
@@ -819,6 +872,8 @@ def restore(root, session):
             if not matches(path, ident):
                 raise Problem(f"Edited file has moved or been replaced: {str(path)!r}")
             check_hash(path, checksum)
+            if os.name == "nt" and windows_stream_hashes(path) != manifest["streams"].get(token, {}):
+                raise Problem(f"Alternate data streams changed since the sweep: {str(path)!r}")
             if output_mode(path) != mode:
                 raise Problem(f"File permissions changed since the sweep: {str(path)!r}")
     status(session, "undoing", count)

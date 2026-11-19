@@ -373,7 +373,12 @@ class SweepTests(unittest.TestCase):
                 sweep.location(self.root, None, token)
         self.assertFalse((self.root / sweep.STATE).exists())
         self.run_cli('apply', 'Bob', 'Martin')
-        self.assertEqual((self.root / 'Martin.cmd:example').read_bytes(), b'original stream')
+        changed_stream = self.root / 'Martin.cmd:example'
+        self.assertEqual(changed_stream.read_bytes(), b'original stream')
+        changed_stream.write_bytes(b'later stream change')
+        self.assertIn('Alternate data streams changed', self.run_cli('undo', success=False))
+        self.assertEqual(changed_stream.read_bytes(), b'later stream change')
+        changed_stream.write_bytes(b'original stream')
         self.run_cli('undo')
         self.assertEqual(stream.read_bytes(), b'original stream')
         self.assertEqual(src.read_bytes(), b'Bob\r\n')
