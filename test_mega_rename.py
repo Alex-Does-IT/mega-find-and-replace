@@ -363,6 +363,9 @@ class SweepTests(unittest.TestCase):
         src = self.file('Bob.cmd', b'Bob\r\n')
         stream = Path(str(src) + ':example')
         stream.write_bytes(b'original stream')
+        copy = self.tmp / 'staged'
+        sweep.copy_for_edit(src, copy)
+        self.assertEqual(Path(str(copy) + ':example').read_bytes(), b'original stream')
         for target in ('NUL', 'AUX.txt', 'Martin:', 'Martin.', 'Martin '):
             self.run_cli('apply', 'Bob.cmd', target, '--literal', success=False)
         for token in ('tree/C:escape', 'tree/..\\outside', 'tree/file:stream', 'tree/NUL'):
@@ -374,6 +377,25 @@ class SweepTests(unittest.TestCase):
         self.run_cli('undo')
         self.assertEqual(stream.read_bytes(), b'original stream')
         self.assertEqual(src.read_bytes(), b'Bob\r\n')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows access control and sharing modes')
+    def test_windows_explicit_acl_and_file_in_use(self):
+        first = self.file('a.txt', b'Bob')
+        src = self.file('z.txt', b'Bob')
+        subprocess.run(['icacls', src, '/inheritance:d'], check=True, capture_output=True)
+        def acl():
+            return subprocess.check_output(['icacls', src])
+        before = acl()
+        with src.open('rb'):
+            # The first edit has already moved when the second source refuses deletion.
+            self.run_cli('apply', 'Bob', 'Martin', success=False)
+        self.assertEqual(first.read_bytes(), b'Bob')
+        self.assertEqual(src.read_bytes(), b'Bob')
+        self.run_cli('apply', 'Bob', 'Martin')
+        self.assertEqual(src.read_bytes(), b'Martin')
+        self.assertEqual(acl(), before)
+        self.run_cli('undo')
+        self.assertEqual(acl(), before)
 
     @unittest.skipUnless(os.name == 'nt', 'Windows directory junction')
     def test_windows_junction_stays_outside_sweep_and_journal(self):

@@ -540,6 +540,26 @@ def locked(root):
         os.close(fd)
 
 
+def restrict_windows_journal(folder):
+    # os.mkdir(mode=0o700) only sets Windows ACLs starting with Python 3.13.
+    # Apply an inheritable private DACL before putting any project data here.
+    security = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    convert = security.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+    security.SetFileSecurityW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    descriptor = ctypes.c_void_p()
+    # Owner Rights, Local System, and the local Administrators group.
+    if not convert("D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", 1, ctypes.byref(descriptor), None):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        if not security.SetFileSecurityW(str(folder), 0x80000004, descriptor):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        kernel.LocalFree(descriptor)
+
+
 def storage(root, create=False):
     area = root / STATE
     marker = area / "format"
@@ -551,6 +571,8 @@ def storage(root, create=False):
         with tempfile.TemporaryDirectory(dir=root, prefix=".mega-rename-init-") as temp:
             fresh = Path(temp) / STATE
             fresh.mkdir(mode=0o700)
+            if os.name == "nt":
+                restrict_windows_journal(fresh)
             (fresh / ".gitignore").write_text("*\n")
             (fresh / "format").write_bytes(MAGIC)
             exclusive_move(fresh, area)
@@ -718,7 +740,11 @@ def prepare(root, area, plan, rewrite):
             mode = stat.S_IMODE(stage.stat().st_mode)
             if not mode & stat.S_IWUSR:
                 stage.chmod(mode | stat.S_IWUSR)
-            stage.write_bytes(result[2])
+            # Truncating the default stream via CREATE_ALWAYS can also remove
+            # NTFS alternate streams. Resize the already-open copied stream.
+            with stage.open("r+b") as output:
+                output.write(result[2])
+                output.truncate()
             stage.chmod(mode & ~(stat.S_ISUID | stat.S_ISGID))
             new_ident = identity(stage.stat())
             moves.extend([(source, f"save/before-{i}", ident, old_hash),
