@@ -3,7 +3,7 @@
 // A restored webview can replay its script in the same window. Acquire the
 // bridge once and bind controls once per document body.
 (function bootstrap(mount) {
-  const key = Symbol.for('alexdoesit-llc.mega-replace.mount');
+  const key = Symbol.for('alex-does-it.mega-replace.mount');
   if (!window[key]) {
     const api = acquireVsCodeApi();
     let body, listeners;
