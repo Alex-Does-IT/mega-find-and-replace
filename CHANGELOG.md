@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.6
+
+Shortened the README and updated the Marketplace listing with a worked example of renaming files, folders, and text across naming conventions.
+
 ## 0.1.5
 
 Published the VS Code edition under the registered Alex Does IT LLC publisher, `alexdoesitllc`. The CLI and rename behavior are the same as in 0.1.4.
